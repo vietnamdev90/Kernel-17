@@ -76,6 +76,14 @@ jobs:
           test -f kernel_platform/tools/bazel.origin.sh
           df -h .
 
+      - name: Restore pinned OPlus DTS overlays and Bazel package link
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash tools/restore-oneplus-devicetree.sh
+          test -f kernel_platform/soc-repo/arch/arm64/boot/dts/vendor/BUILD.bazel
+          test -f kernel_platform/soc-repo/arch/arm64/boot/dts/vendor/oplus/platform_map.bzl
+
       - name: Build and stage Canoe performance kernel
         shell: bash
         run: |
