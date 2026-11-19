@@ -84,6 +84,12 @@ jobs:
           test -f kernel_platform/soc-repo/arch/arm64/boot/dts/vendor/BUILD.bazel
           test -f kernel_platform/soc-repo/arch/arm64/boot/dts/vendor/oplus/platform_map.bzl
 
+      - name: Restore missing OPlus Bazel layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash tools/restore-kernel-build-layout.sh
+
       - name: Build and stage Canoe performance kernel
         shell: bash
         run: |
