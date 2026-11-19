@@ -1,0 +1,103 @@
+name: 2 - Build kernel using Release prebuilts
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Optional prebuilt Release tag (blank = manifest-matched tag)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kernel-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Free runner disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/share/powershell /opt/ghc || true
+          df -h .
+
+      - name: Download and verify matching Release prebuilts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          EXPECTED_TAG="prebuilts-$(sha256sum oneplus_15.xml | cut -d' ' -f1 | cut -c1-12)"
+          TAG="$EXPECTED_TAG"
+          if [[ -n "$INPUT_TAG" ]]; then
+            TAG="$INPUT_TAG"
+          fi
+          echo "Downloading prebuilts from Release: $TAG"
+
+          ASSETS="$RUNNER_TEMP/prebuilts-assets"
+          mkdir -p "$ASSETS"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --dir "$ASSETS" \
+            --pattern 'prebuilts.tar.gz*' \
+            --pattern 'prebuilts.sha256' \
+            --pattern 'oneplus_15.sha256'
+
+          # The archive is strictly bound to the manifest checked out above.
+          sha256sum --check "$ASSETS/oneplus_15.sha256"
+
+          if [[ ! -f "$ASSETS/prebuilts.tar.gz" ]]; then
+            shopt -s nullglob
+            PARTS=("$ASSETS"/prebuilts.tar.gz.part-*)
+            if (( ${#PARTS[@]} == 0 )); then
+              echo "Release has no prebuilts.tar.gz or numbered parts" >&2
+              exit 1
+            fi
+            cat "${PARTS[@]}" > "$ASSETS/prebuilts.tar.gz"
+          fi
+
+          (cd "$ASSETS" && sha256sum --check prebuilts.sha256)
+          tar -xzf "$ASSETS/prebuilts.tar.gz" -C "$GITHUB_WORKSPACE" --no-same-owner
+          python3 tools/kernel_prebuilts.py restore-links
+
+          # Check the actual launcher path used by Kleaf on this repository.
+          test -f kernel_platform/prebuilts/build-tools/linux_musl-x86/bin/py3-cmd
+          test -f kernel_platform/tools/bazel.origin.sh
+          df -h .
+
+      - name: Build and stage Canoe performance kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/kernel-dist"
+          cd kernel_platform
+          # Bazel run also performs the build, then copies the distribution
+          # output to the specified directory.
+          tools/bazel run --jobs=2 //soc-repo:canoe_perf_dist -- \
+            --dist_dir "$GITHUB_WORKSPACE/kernel-dist"
+
+          if [[ -z "$(find "$GITHUB_WORKSPACE/kernel-dist" -type f -print -quit)" ]]; then
+            echo "Build completed but the distribution directory is empty" >&2
+            exit 1
+          fi
+          ls -lh "$GITHUB_WORKSPACE/kernel-dist"
+
+      - name: Upload compiled kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: canoe-perf-kernel-${{ github.run_number }}
+          path: kernel-dist/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 1
