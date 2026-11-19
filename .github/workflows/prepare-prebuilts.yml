@@ -1,0 +1,116 @@
+name: 1 - Prepare kernel prebuilts release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kernel-prebuilts-release
+  cancel-in-progress: false
+
+jobs:
+  prebuilts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Free runner disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/share/powershell /opt/ghc || true
+          df -h .
+
+      - name: Install repo and archive tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends git curl python3 pigz
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$RUNNER_TEMP/repo"
+          chmod +x "$RUNNER_TEMP/repo"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Download pinned prebuilts from oneplus_15.xml
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$RUNNER_TEMP:$PATH"
+
+          # Use a tiny local manifest git repository: do not clone the huge
+          # kernel source a second time just to run repo sync.
+          mkdir -p "$RUNNER_TEMP/prebuilts-manifest"
+          cp oneplus_15.xml "$RUNNER_TEMP/prebuilts-manifest/"
+          git -C "$RUNNER_TEMP/prebuilts-manifest" init -q -b main
+          git -C "$RUNNER_TEMP/prebuilts-manifest" add oneplus_15.xml
+          git -C "$RUNNER_TEMP/prebuilts-manifest" -c user.name=github-actions -c user.email=actions@users.noreply.github.com commit -qm "Pin prebuilts manifest"
+
+          repo init -u "file://$RUNNER_TEMP/prebuilts-manifest" -b main -m oneplus_15.xml --no-clone-bundle --depth=1
+          mapfile -t PROJECTS < <(python3 tools/kernel_prebuilts.py paths)
+          if (( ${#PROJECTS[@]} == 0 )); then
+            echo "No kernel_platform/prebuilts projects found in manifest" >&2
+            exit 1
+          fi
+          printf 'Syncing %s prebuilt repositories\n' "${#PROJECTS[@]}"
+          repo sync --fail-fast --no-tags --no-clone-bundle -j4 "${PROJECTS[@]}"
+          python3 tools/kernel_prebuilts.py verify
+          # Git metadata is not part of the binary prebuilt package.
+          rm -rf .repo
+
+      - name: Create tar.gz, checksums, and optional release parts
+        shell: bash
+        run: |
+          set -euo pipefail
+          ASSETS="$RUNNER_TEMP/prebuilts-assets"
+          mkdir -p "$ASSETS"
+
+          # Archive only the pinned prebuilt toolchains, never git history.
+          tar --exclude-vcs --sort=name --mtime='UTC 2020-01-01' \
+            --owner=0 --group=0 --numeric-owner -C "$GITHUB_WORKSPACE" \
+            -cf - kernel_platform/prebuilts | pigz -3 -p 2 > "$ASSETS/prebuilts.tar.gz"
+
+          (cd "$ASSETS" && sha256sum prebuilts.tar.gz > prebuilts.sha256)
+          sha256sum oneplus_15.xml > "$ASSETS/oneplus_15.sha256"
+
+          # GitHub Release assets have a per-file size limit of 2 GiB.
+          # Keep each part well below that limit if the archive is larger.
+          SIZE=$(stat -c '%s' "$ASSETS/prebuilts.tar.gz")
+          if (( SIZE > 1800 * 1024 * 1024 )); then
+            split -b 1800M -d -a 3 "$ASSETS/prebuilts.tar.gz" "$ASSETS/prebuilts.tar.gz.part-"
+            rm "$ASSETS/prebuilts.tar.gz"
+          fi
+          ls -lh "$ASSETS"
+
+      - name: Create or update matching GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          MANIFEST_SHA=$(sha256sum oneplus_15.xml | cut -d' ' -f1)
+          TAG="prebuilts-$(printf '%s' "$MANIFEST_SHA" | cut -c1-12)"
+
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "OnePlus 15 prebuilts ($TAG)" \
+              --notes "Prebuilt toolchains pinned by oneplus_15.xml (SHA256: $MANIFEST_SHA). If the tar.gz is split, concatenate the numbered .part-* assets before extraction. Rebuild and verify using prebuilts.sha256." \
+              --prerelease
+          fi
+
+          # Clear old prebuilt assets only; keep unrelated Release attachments.
+          mapfile -t OLD_ASSETS < <(
+            gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' |
+              grep -E '^(prebuilts\.tar\.gz(\.part-[0-9]{3})?|prebuilts\.sha256|oneplus_15\.sha256)$' || true
+          )
+          for asset in "${OLD_ASSETS[@]}"; do
+            gh release delete-asset "$TAG" "$asset" --repo "$GITHUB_REPOSITORY" --yes
+          done
+          gh release upload "$TAG" "$RUNNER_TEMP"/prebuilts-assets/* --repo "$GITHUB_REPOSITORY"
+          echo "Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
